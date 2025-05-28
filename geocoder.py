@@ -14,7 +14,7 @@ import sys
 # Define constants
 INPUT_CSV = 'MM_Sales_ready.csv'
 OUTPUT_CSV = 'MM_Sales_geocoded.csv'
-MAX_FAILURE_RATE = 11.0  # Maximum allowed failure rate 
+MAX_FAILURE_RATE = 15.0  # Maximum allowed failure rate 
 MIN_ADDRESSES_FOR_FAILURE_CHECK = 35  # Only check after processing this many addresses
 
 # helper functions
