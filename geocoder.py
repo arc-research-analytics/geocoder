@@ -13,7 +13,8 @@ import sys
 
 # Define constants
 INPUT_CSV = 'MM_Sales_ready.csv'
-OUTPUT_CSV = 'MM_Sales_geocoded.csv'
+OUTPUT_CSV = 'MM_Sales_geocoded_tester.csv'
+UNIQUE_ID = 'id'  # Column in input CSV that contains unique identifiers
 MAX_FAILURE_RATE = 15.0  # Maximum allowed failure rate 
 MIN_ADDRESSES_FOR_FAILURE_CHECK = 35  # Only check after processing this many addresses
 
@@ -25,6 +26,7 @@ def get_random_delay():
 def geocode_address(address_row, driver, skip_address_print=False):
     """Geocode a single address and return the results"""
     address = address_row.get('Address', 'Unknown Address')
+    unique_id = address_row.get(UNIQUE_ID, 'Unknown ID')
     
     # Skip printing the address since we already printed it in the main function
     if not skip_address_print:
@@ -49,6 +51,7 @@ def geocode_address(address_row, driver, skip_address_print=False):
         
         # Create result dictionary with original data plus coordinates
         geocoded_info = {
+            UNIQUE_ID: unique_id,
             'Address': address,  
             'url': address_row['url'],
             'returned_url': current_url,
@@ -66,6 +69,7 @@ def geocode_address(address_row, driver, skip_address_print=False):
         
         # Return error result
         geocoded_info = {
+            UNIQUE_ID: unique_id,
             'Address': address,
             'url': address_row['url'],
             'returned_url': 'error',
@@ -85,7 +89,7 @@ def save_geocoded_address(geocoded_info):
     
     try:
         with open(OUTPUT_CSV, 'a', newline='', encoding='utf-8') as csvfile:
-            fieldnames = ['Address', 'url', 'returned_url', 'lat', 'long']
+            fieldnames = [UNIQUE_ID, 'Address', 'url', 'returned_url', 'lat', 'long']
             writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
             if write_header:
                 writer.writeheader()
@@ -112,21 +116,44 @@ def check_failure_rate(success_count, failure_count):
     
     return False
 
+def validate_unique_id_field(df):
+    """Validate that the UNIQUE_ID column exists in the dataframe"""
+    if UNIQUE_ID not in df.columns:
+        available_columns = ", ".join(df.columns)
+        print(f"❌ Error: UNIQUE_ID column '{UNIQUE_ID}' not found in input CSV.")
+        print(f"Available columns: {available_columns}")
+        print("Please set the UNIQUE_ID constant at the top of the script to one of these columns.")
+        sys.exit(1)
+
 # main function
 def main():
     # Load all addresses to geocode
     universe = pd.read_csv(INPUT_CSV)
+    validate_unique_id_field(universe)
     print(f"📊 {len(universe):,} total addresses to geocode in this batch!")
 
     # Check what's already been geocoded
     if os.path.exists(OUTPUT_CSV):
-        geocoded_addresses = pd.read_csv(OUTPUT_CSV)
-        print(f"📝 {len(geocoded_addresses):,} addresses already geocoded")
-        
-        # Find addresses that haven't been geocoded yet
-        # Adjust the column name used for comparison based on your data
-        geocoded_urls = set(geocoded_addresses['url'].tolist())
-        ungeocoded_addresses = universe[~universe['url'].isin(geocoded_urls)]
+        try:
+            geocoded_addresses = pd.read_csv(OUTPUT_CSV)
+            
+            # Validate that the UNIQUE_ID column exists in the output CSV
+            if UNIQUE_ID not in geocoded_addresses.columns:
+                print(f"⚠️ Warning: UNIQUE_ID column '{UNIQUE_ID}' not found in output CSV.")
+                print("Starting geocoding from scratch to include this column.")
+                geocoded_addresses = pd.DataFrame()
+            else:
+                print(f"📝 {len(geocoded_addresses):,} addresses already geocoded")
+                
+                # Find addresses that haven't been geocoded yet using the unique ID
+                geocoded_ids = set(geocoded_addresses[UNIQUE_ID].astype(str).tolist())
+                ungeocoded_addresses = universe[~universe[UNIQUE_ID].astype(str).isin(geocoded_ids)]
+                print(f"🔍 Found {len(ungeocoded_addresses):,} addresses that need geocoding")
+        except Exception as e:
+            print(f"⚠️ Error reading output CSV: {str(e)}")
+            print("Starting geocoding from scratch.")
+            geocoded_addresses = pd.DataFrame()
+            ungeocoded_addresses = universe
     else:
         # Starting from scratch
         ungeocoded_addresses = universe
@@ -160,6 +187,7 @@ def main():
     })
 
     total_addresses = len(universe)
+    ungeocoded_count = len(ungeocoded_addresses)
     geocoded_so_far = len(geocoded_addresses) if not geocoded_addresses.empty else 0
     address_count = 0
     success_count = 0
@@ -167,6 +195,8 @@ def main():
     consecutive_failures = 0
     max_consecutive_failures = 5
 
+    print(f"🚀 Starting geocoding for {ungeocoded_count:,} addresses")
+    
     try:
         # Process each ungeocoded address
         for _, address_row in ungeocoded_addresses.iterrows():
@@ -174,9 +204,10 @@ def main():
             current_count = geocoded_so_far + address_count
             print("------------------------------------------------")
             
-            # Get the address for the combined print statement
+            # Get the address and ID for the combined print statement
             address = address_row.get('Address', 'Unknown Address')
-            print(f"🔍 Processing {address} ({current_count:,}/{total_addresses:,} - {(current_count/total_addresses)*100:.1f}% complete)")
+            unique_id = address_row.get(UNIQUE_ID, 'Unknown ID')
+            print(f"🔍 Processing {address} (ID: {unique_id}, {address_count:,}/{ungeocoded_count:,} - {(address_count/ungeocoded_count)*100:.1f}% complete)")
             
             geocoded_info = geocode_address(address_row, driver, skip_address_print=True)
             save_geocoded_address(geocoded_info)
@@ -229,19 +260,28 @@ def main():
         driver.quit()
 
     # Print summary statistics
-    final_results = pd.read_csv(OUTPUT_CSV)
-    # Determine success/failure based on lat column instead of status
-    successful = len(final_results[final_results['lat'] != 'error'])
-    failed = len(final_results[final_results['lat'] == 'error'])
-    total = len(final_results)
-    failure_rate = (failed / total) * 100 if total > 0 else 0
+    try:
+        final_results = pd.read_csv(OUTPUT_CSV)
+        # Determine success/failure based on lat column instead of status
+        successful = len(final_results[final_results['lat'] != 'error'])
+        failed = len(final_results[final_results['lat'] == 'error'])
+        total = len(final_results)
+        failure_rate = (failed / total) * 100 if total > 0 else 0
 
-    print(f"\n📊 Geocoding Summary:")
-    print(f"✅ Successfully geocoded: {successful:,}")
-    print(f"❌ Failed to geocode: {failed:,}")
-    print(f"📈 Success rate: {(successful/total)*100:.1f}%")
-    print(f"📉 Failure rate: {failed}/{total} ({failure_rate:.1f}%)")
-    print(f"🔧 Addresses needing manual geocoding: {failed:,}")
+        print(f"\n📊 Geocoding Summary:")
+        print(f"✅ Successfully geocoded: {successful:,}")
+        print(f"❌ Failed to geocode: {failed:,}")
+        print(f"📈 Success rate: {(successful/total)*100:.1f}%")
+        print(f"📉 Failure rate: {failed}/{total} ({failure_rate:.1f}%)")
+        print(f"🔧 Addresses needing manual geocoding: {failed:,}")
+        
+        # Check if all addresses were processed
+        if len(final_results) == len(universe):
+            print("✅ All addresses from the input file were processed!")
+        else:
+            print(f"⚠️ Note: {len(universe) - len(final_results):,} addresses from the input file were not processed.")
+    except Exception as e:
+        print(f"❌ Error reading final results: {str(e)}")
 
 if __name__ == '__main__':
     main()
