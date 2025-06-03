@@ -21,6 +21,9 @@ df['url'] = ['https://www.google.com/maps/search/' + i for i in df['full_address
 # create unique id for each row
 df['id'] = df.index
 
+# create a fallback column in case the lat / long of 'url' is not found
+df['url_fallback'] = df['City'] + ", " + df['State'] 
+
 # move this new 'id' column to the first position
 df = df[['id'] + [col for col in df.columns if col != 'id']]
 

@@ -18,11 +18,35 @@ UNIQUE_ID = 'id'  # Column in input CSV that contains unique identifiers
 MAX_FAILURE_RATE = 15.0  # Maximum allowed failure rate 
 MIN_ADDRESSES_FOR_FAILURE_CHECK = 35  # Only check after processing this many addresses
 
-# helper functions
+#############################################
+# HELPER FUNCTIONS
+#############################################
+
+# This function introduces randomized delays between requests to avoid detection
+# and rate limiting when making multiple calls to Google Maps.
+# The delay time varies between 3.8 and 8 seconds to appear more human-like.
 def get_random_delay():
     """Return a random delay between 3.8 and 8 seconds"""
     return random.uniform(3.8, 8.0)
 
+# This function extracts geographic coordinates from a Google Maps URL.
+# It uses regex to find the latitude and longitude values embedded in the URL.
+# Returns the coordinates and a success flag to indicate if extraction was successful.
+def parse_coordinates(url):
+    """Extract latitude and longitude from a Google Maps URL"""
+    try:
+        found = re.search('/@(.+?),17z', url).group(1)
+        lat = found.split(',')[0]
+        lng = found.split(',')[1]
+        return lat, lng, True
+    except:
+        return 'error', 'error', False
+
+# This is the core geocoding function that handles both primary and fallback geocoding.
+# It first attempts to geocode the full address URL, and if that fails,
+# it tries the fallback URL (city, state) if available.
+# The function handles errors gracefully and returns a structured result with
+# coordinates and status information.
 def geocode_address(address_row, driver, skip_address_print=False):
     """Geocode a single address and return the results"""
     address = address_row.get('Address', 'Unknown Address')
@@ -33,31 +57,54 @@ def geocode_address(address_row, driver, skip_address_print=False):
         print(f"🔍 Attempting to geocode {address}...")
     
     try:
+        # Try primary URL first (full address)
         driver.get(address_row['url'])
         delay = get_random_delay()
         sleep(delay)
         current_url = driver.current_url
         
-        # Parse coordinates from URL
-        try:
-            found = re.search('/@(.+?),17z', current_url).group(1)
-            lat = found.split(',')[0]
-            lng = found.split(',')[1]
-            print(f"✅ Successfully geocoded!")
-        except:
-            lat = 'error'
-            lng = 'error'
-            print(f"❌ Failed geocode.")
+        # Parse coordinates from primary URL
+        lat, lng, success = parse_coordinates(current_url)
+        source_url = address_row['url']
+        used_fallback = False
+        
+        # If primary URL failed, try fallback URL (city, state)
+        if not success and 'url_fallback' in address_row:
+            print(f"⚠️ Primary geocoding failed. Trying fallback (city, state)...")
+            # Construct full Google Maps URL for the fallback
+            fallback_url = 'https://www.google.com/maps/search/' + address_row['url_fallback'].replace(' ', '%20')
+            
+            # Navigate to fallback URL
+            driver.get(fallback_url)
+            delay = get_random_delay()
+            sleep(delay)
+            fallback_current_url = driver.current_url
+            
+            # Parse coordinates from fallback URL
+            lat, lng, success = parse_coordinates(fallback_current_url)
+            if success:
+                print(f"✅ Successfully geocoded using fallback!")
+                current_url = fallback_current_url
+                source_url = fallback_url
+                used_fallback = True
+            else:
+                print(f"❌ Fallback geocoding also failed.")
+        else:
+            if success:
+                print(f"✅ Successfully geocoded!")
+            else:
+                print(f"❌ Primary geocoding failed (no fallback attempted).")
         
         # Create result dictionary with original data plus coordinates
         geocoded_info = {
             UNIQUE_ID: unique_id,
             'Address': address,  
-            'url': address_row['url'],
+            'url': source_url,
             'returned_url': current_url,
             'lat': lat,
             'long': lng,
-            'status': 'success' if lat != 'error' else 'failed'
+            'used_fallback': used_fallback,
+            'status': 'success' if success else 'failed'
         }
         
         return geocoded_info
@@ -75,17 +122,22 @@ def geocode_address(address_row, driver, skip_address_print=False):
             'returned_url': 'error',
             'lat': 'error',
             'long': 'error',
+            'used_fallback': False,
             'status': f'error: {str(e)}'
         }
         return geocoded_info
 
+# This function saves a successfully geocoded address to the output CSV file.
+# It handles creating the file with headers if it doesn't exist,
+# and appends new results to existing files.
+# The function removes internal status fields before writing to CSV.
 def save_geocoded_address(geocoded_info):
     """Save a single geocoded address to CSV without the status field"""
     file_exists = os.path.exists(OUTPUT_CSV)
     write_header = not file_exists or os.path.getsize(OUTPUT_CSV) == 0
 
-    # Create a copy of geocoded_info without the status field
-    output_info = {k: v for k, v in geocoded_info.items() if k != 'status'}
+    # Create a copy of geocoded_info without the status and used_fallback fields
+    output_info = {k: v for k, v in geocoded_info.items() if k not in ['status', 'used_fallback']}
     
     try:
         with open(OUTPUT_CSV, 'a', newline='', encoding='utf-8') as csvfile:
@@ -99,6 +151,10 @@ def save_geocoded_address(geocoded_info):
     except Exception as e:
         print(f"❌ Error writing to CSV: {str(e)}")
 
+# This function monitors the geocoding process for excessive failures.
+# If the failure rate exceeds the defined threshold, it will trigger
+# an auto-shutoff to prevent wasting resources on likely systemic issues.
+# Only activates after processing a minimum number of addresses.
 def check_failure_rate(success_count, failure_count):
     """Check if failure rate exceeds threshold and return True if process should stop"""
     total = success_count + failure_count
@@ -116,6 +172,9 @@ def check_failure_rate(success_count, failure_count):
     
     return False
 
+# This function ensures that the unique ID column specified in the constants
+# actually exists in the input data. If not, it displays available columns
+# and exits the program with helpful information.
 def validate_unique_id_field(df):
     """Validate that the UNIQUE_ID column exists in the dataframe"""
     if UNIQUE_ID not in df.columns:
@@ -130,7 +189,13 @@ def main():
     # Load all addresses to geocode
     universe = pd.read_csv(INPUT_CSV)
     validate_unique_id_field(universe)
-    print(f"📊 {len(universe):,} total addresses to geocode in this batch!")
+    
+    # Check if url_fallback column exists
+    has_fallback = 'url_fallback' in universe.columns
+    if has_fallback:
+        print(f"📊 {len(universe):,} total addresses to geocode in this batch with fallback option!")
+    else:
+        print(f"📊 {len(universe):,} total addresses to geocode in this batch (no fallback option available)!")
 
     # Check what's already been geocoded
     if os.path.exists(OUTPUT_CSV):
@@ -192,6 +257,7 @@ def main():
     address_count = 0
     success_count = 0
     failure_count = 0
+    fallback_success_count = 0
     consecutive_failures = 0
     max_consecutive_failures = 5
 
@@ -216,6 +282,10 @@ def main():
             if geocoded_info['status'] == 'success':
                 success_count += 1
                 consecutive_failures = 0
+                
+                # Track fallback successes
+                if geocoded_info.get('used_fallback', False):
+                    fallback_success_count += 1
             else:
                 failure_count += 1
                 consecutive_failures += 1
@@ -225,6 +295,8 @@ def main():
             failure_rate = (failure_count / total_processed) * 100 if total_processed > 0 else 0
             
             print(f"📊 Current session: {success_count} successful, {failure_count} failed")
+            if fallback_success_count > 0:
+                print(f"🔄 Fallback used successfully: {fallback_success_count} times")
             print(f"📉 Failure rate: {failure_rate:.1f}%")
             
             # Check if we should stop due to high failure rate
@@ -270,6 +342,8 @@ def main():
 
         print(f"\n📊 Geocoding Summary:")
         print(f"✅ Successfully geocoded: {successful:,}")
+        if fallback_success_count > 0:
+            print(f"🔄 Used fallback geocoding successfully: {fallback_success_count:,}")
         print(f"❌ Failed to geocode: {failed:,}")
         print(f"📈 Success rate: {(successful/total)*100:.1f}%")
         print(f"📉 Failure rate: {failed}/{total} ({failure_rate:.1f}%)")
